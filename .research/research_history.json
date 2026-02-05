@@ -883,5 +883,146 @@
     "experimental_code": "import re, random, math\nimport torch\nfrom transformers import AutoTokenizer, AutoModelForSeq2SeqLM\n\nMODEL = \"google/flan-t5-small\"\ntok = AutoTokenizer.from_pretrained(MODEL)\nmdl = AutoModelForSeq2SeqLM.from_pretrained(MODEL)\nmdl.eval()\n\n# ------------------ data ------------------\n\ndef make_data(n=500, seed=0):\n    rng = random.Random(seed)\n    ops = [\"+\", \"-\", \"*\"]\n    data = []\n    for _ in range(n):\n        a, b = rng.randint(0, 50), rng.randint(0, 50)\n        op = rng.choice(ops)\n        ans = a + b if op == \"+\" else (a - b if op == \"-\" else a * b)\n        x = f\"What is {a} {op} {b}?\"\n        data.append((x, str(ans)))\n    return data\n\n_ints = re.compile(r\"-?\\d+\")\n\ndef ints_in(text: str):\n    return _ints.findall(text)\n\n# High-fidelity \"true\" verifier: strict formatting (first integer must be the answer)\n\ndef true_score_strict(pred_text: str, gold: str) -> float:\n    xs = ints_in(pred_text)\n    return 1.0 if (len(xs) > 0 and xs[0] == gold) else 0.0\n\n# Cheap proxy: lenient match (any integer match), plus optional stochastic flips\n\ndef proxy_score_lenient(pred_text: str, gold: str, p_flip: float, rng: random.Random) -> float:\n    xs = ints_in(pred_text)\n    s = 1.0 if (gold in xs) else 0.0\n    if rng.random() < p_flip:\n        s = 1.0 - s\n    return s\n\n# ------------------ generation helpers ------------------\n\ndef gen_one(prompt, max_new_tokens=80, do_sample=False, temperature=0.7):\n    inputs = tok(prompt, return_tensors=\"pt\")\n    with torch.no_grad():\n        out = mdl.generate(\n            **inputs,\n            max_new_tokens=max_new_tokens,\n            do_sample=do_sample,\n            temperature=temperature,\n        )\n    return tok.decode(out[0], skip_special_tokens=True).strip()\n\n\ndef gen_many(prompt, B=4, max_new_tokens=80, temperature=0.8):\n    inputs = tok(prompt, return_tensors=\"pt\")\n    with torch.no_grad():\n        outs = mdl.generate(\n            **inputs,\n            max_new_tokens=max_new_tokens,\n            do_sample=True,\n            temperature=temperature,\n            num_return_sequences=B,\n        )\n    return [tok.decode(o, skip_special_tokens=True).strip() for o in outs]\n\n# ------------------ baselines ------------------\n\ndef direct(x):\n    return gen_one(f\"Solve and output ONLY the number.\\nProblem: {x}\\nAnswer:\")\n\n\ndef self_refine(x, T=3):\n    y = direct(x)\n    for _ in range(T):\n        fb = gen_one(\n            \"You are a strict math checker. Given the problem and the proposed answer, \"\n            \"say what is wrong (if anything) and how to fix it.\\n\"\n            f\"Problem: {x}\\nProposed answer: {y}\\nFeedback:\" )\n        # Note: refine prompt can sometimes elicit verbosity, creating proxy-gaming risk\n        y = gen_one(\n            \"Revise the answer using the feedback.\\n\"\n            \"IMPORTANT: Put the final answer first, then you may add a brief explanation.\\n\"\n            f\"Problem: {x}\\nCurrent answer: {y}\\nFeedback: {fb}\\nRevised response:\" )\n    return y\n\n# ------------------ confidence utilities ------------------\n\ndef hoeffding_rad(n, delta):\n    return math.sqrt(math.log(2.0 / delta) / (2.0 * max(1, n)))\n\n\ndef beta_q(a, b, q):\n    # quantile of Beta(a,b) using torch\n    dist = torch.distributions.Beta(torch.tensor(float(a)), torch.tensor(float(b)))\n    return float(dist.icdf(torch.tensor(float(q))))\n\n# ------------------ SCG-SR with proxy only (no audits) ------------------\n\ndef scg_sr_proxy(\n    x,\n    gold,\n    T=3,\n    B=4,\n    lam=0.01,\n    p_flip=0.1,\n    delta=0.05,\n    tau=0.0,\n    per_round_proxy_budget=12,\n    patience=1,\n    seed=0,\n):\n    rng = random.Random(seed)\n\n    def util(mean_proxy, y_text):\n        return mean_proxy - lam * len(tok.encode(y_text))\n\n    y_star = direct(x)\n    n_star, sum_star = 1, proxy_score_lenient(y_star, gold, p_flip, rng)\n\n    bad = 0\n    for _ in range(T):\n        fb = gen_one(\n            \"You are a strict math checker. Given the problem and the proposed answer, \"\n            \"say what is wrong (if anything) and how to fix it.\\n\"\n            f\"Problem: {x}\\nProposed answer: {y_star}\\nFeedback:\" )\n        refine_prompt = (\n            \"Revise the answer using the feedback.\\n\"\n            \"IMPORTANT: Put the final answer first, then you may add a brief explanation.\\n\"\n            f\"Problem: {x}\\nCurrent answer: {y_star}\\nFeedback: {fb}\\nRevised response:\" )\n        cands = gen_many(refine_prompt, B=B)\n\n        n = [0]*B\n        s = [0.0]*B\n        evals = 0\n        for i in range(B):\n            if evals >= per_round_proxy_budget:\n                break\n            n[i] += 1\n            s[i] += proxy_score_lenient(cands[i], gold, p_flip, rng)\n            evals += 1\n        if evals < per_round_proxy_budget:\n            n_star += 1\n            sum_star += proxy_score_lenient(y_star, gold, p_flip, rng)\n            evals += 1\n\n        while evals < per_round_proxy_budget:\n            ucbs = []\n            lcbs = []\n            for i in range(B):\n                mean_i = s[i] / max(1, n[i])\n                r = hoeffding_rad(n[i], delta/(B+1))\n                ucbs.append(util(min(1.0, mean_i + r), cands[i]))\n                lcbs.append(util(max(0.0, mean_i - r), cands[i]))\n            order = sorted(range(B), key=lambda i: ucbs[i], reverse=True)\n            best_i = order[0]\n            second_i = order[1] if B > 1 else order[0]\n            if lcbs[best_i] > ucbs[second_i] + 1e-9:\n                break\n            # sample best UCB arm\n            i = best_i\n            n[i] += 1\n            s[i] += proxy_score_lenient(cands[i], gold, p_flip, rng)\n            evals += 1\n\n        # select by conservative proxy LCB\n        best_i, best_lcb = 0, -1e9\n        for i in range(B):\n            mean_i = s[i] / max(1, n[i])\n            r = hoeffding_rad(n[i], delta/(B+1))\n            lcb = util(max(0.0, mean_i - r), cands[i])\n            if lcb > best_lcb:\n                best_lcb, best_i = lcb, i\n\n        mean_star = sum_star / n_star\n        r_star = hoeffding_rad(n_star, delta/(B+1))\n        ucb_star = util(min(1.0, mean_star + r_star), y_star)\n\n        if best_lcb > ucb_star + tau:\n            y_star = cands[best_i]\n            n_star, sum_star = 1, proxy_score_lenient(y_star, gold, p_flip, rng)\n            bad = 0\n        else:\n            bad += 1\n            if bad >= patience:\n                break\n\n    return y_star\n\n# ------------------ Proposed: ACCR (audit-calibrated) ------------------\n\nclass ProxyCalibrator:\n    \"\"\"Online Beta-posteriors for proxy precision and true-negative-rate.\"\"\"\n    def __init__(self, a_pi=1, b_pi=1, a_nu=1, b_nu=1):\n        # pi = P(true=1|proxy=1)\n        self.a_pi, self.b_pi = a_pi, b_pi\n        # nu = P(true=0|proxy=0)\n        self.a_nu, self.b_nu = a_nu, b_nu\n\n    def update(self, proxy_outcome: int, true_outcome: int):\n        if proxy_outcome == 1:\n            if true_outcome == 1:\n                self.a_pi += 1\n            else:\n                self.b_pi += 1\n        else:\n            if true_outcome == 0:\n                self.a_nu += 1\n            else:\n                self.b_nu += 1\n\n    def bounds(self, alpha=0.05):\n        l_pi = beta_q(self.a_pi, self.b_pi, alpha/2)\n        u_pi = beta_q(self.a_pi, self.b_pi, 1-alpha/2)\n        l_nu = beta_q(self.a_nu, self.b_nu, alpha/2)\n        u_nu = beta_q(self.a_nu, self.b_nu, 1-alpha/2)\n        return (l_pi, u_pi, l_nu, u_nu)\n\n\ndef accr(\n    x,\n    gold,\n    calibrator: ProxyCalibrator,\n    T=3,\n    B=4,\n    lam=0.01,\n    p_flip=0.1,\n    delta=0.05,\n    tau=0.0,\n    per_round_proxy_budget=12,\n    per_round_audit_budget=1,\n    alpha_cal=0.05,\n    patience=1,\n    seed=0,\n):\n    rng = random.Random(seed)\n\n    def util_from_trueprob(p_true, y_text):\n        return p_true - lam * len(tok.encode(y_text))\n\n    def calibrated_bounds_from_proxy(mean_proxy, y_text):\n        l_pi, u_pi, l_nu, u_nu = calibrator.bounds(alpha=alpha_cal)\n        # P(true=1|proxy=0) = 1 - nu\n        l_true = mean_proxy * l_pi + (1.0 - mean_proxy) * (1.0 - u_nu)\n        u_true = mean_proxy * u_pi + (1.0 - mean_proxy) * (1.0 - l_nu)\n        return util_from_trueprob(l_true, y_text), util_from_trueprob(u_true, y_text)\n\n    y_star = direct(x)\n    # track proxy estimate for current\n    n_star, sum_star = 1, proxy_score_lenient(y_star, gold, p_flip, rng)\n\n    bad = 0\n    for _ in range(T):\n        fb = gen_one(\n            \"You are a strict math checker. Given the problem and the proposed answer, \"\n            \"say what is wrong (if anything) and how to fix it.\\n\"\n            f\"Problem: {x}\\nProposed answer: {y_star}\\nFeedback:\" )\n        refine_prompt = (\n            \"Revise the answer using the feedback.\\n\"\n            \"IMPORTANT: Put the final answer first, then you may add a brief explanation.\\n\"\n            f\"Problem: {x}\\nCurrent answer: {y_star}\\nFeedback: {fb}\\nRevised response:\" )\n        cands = gen_many(refine_prompt, B=B)\n\n        n = [0]*B\n        s = [0.0]*B\n        proxy_first = [None]*B\n\n        evals = 0\n        for i in range(B):\n            if evals >= per_round_proxy_budget:\n                break\n            out = proxy_score_lenient(cands[i], gold, p_flip, rng)\n            proxy_first[i] = int(out)\n            n[i] += 1\n            s[i] += out\n            evals += 1\n        if evals < per_round_proxy_budget:\n            n_star += 1\n            sum_star += proxy_score_lenient(y_star, gold, p_flip, rng)\n            evals += 1\n\n        # proxy-only sequential sampling to reduce stochasticity\n        while evals < per_round_proxy_budget:\n            # pick arm with highest proxy UCB (unregularized, just for sampling)\n            ucbs = []\n            for i in range(B):\n                mean_i = s[i]/max(1,n[i])\n                r = hoeffding_rad(n[i], delta/(B+1))\n                ucbs.append(min(1.0, mean_i + r))\n            i = max(range(B), key=lambda j: ucbs[j])\n            n[i] += 1\n            s[i] += proxy_score_lenient(cands[i], gold, p_flip, rng)\n            evals += 1\n\n        means = [s[i]/max(1,n[i]) for i in range(B)]\n\n        # allocate audits to proxy-promising candidates (where proxy likely over-optimistic)\n        audit_order = sorted(range(B), key=lambda i: means[i], reverse=True)\n        for k in range(min(per_round_audit_budget, B)):\n            i = audit_order[k]\n            # use the first observed proxy outcome to define the condition for calibration\n            p0 = proxy_first[i]\n            if p0 is None:\n                p0 = int(means[i] >= 0.5)\n            t = int(true_score_strict(cands[i], gold))\n            calibrator.update(p0, t)\n\n        # choose candidate by calibrated lower bound\n        best_i, best_lcbU = 0, -1e9\n        for i in range(B):\n            lcbU, _ = calibrated_bounds_from_proxy(means[i], cands[i])\n            if lcbU > best_lcbU:\n                best_lcbU, best_i = lcbU, i\n\n        mean_star = sum_star / n_star\n        _, ucbU_star = calibrated_bounds_from_proxy(mean_star, y_star)\n\n        if best_lcbU > ucbU_star + tau:\n            y_star = cands[best_i]\n            n_star, sum_star = 1, proxy_score_lenient(y_star, gold, p_flip, rng)\n            bad = 0\n        else:\n            bad += 1\n            if bad >= patience:\n                break\n\n    return y_star\n\n# ------------------ evaluation ------------------\n\ndef eval_acc_strict(fn, data):\n    return sum(true_score_strict(fn(x, g), g) for x, g in data) / len(data)\n\nif __name__ == \"__main__\":\n    dev = make_data(100, seed=0)\n    test = make_data(500, seed=1)\n\n    # small tuning for lambda (kept tiny; main effect is from audit-calibration)\n    lams = [0.0, 0.005, 0.01]\n    best_lam, best_acc = None, -1\n    for lam in lams:\n        cal = ProxyCalibrator()\n        acc = eval_acc_strict(lambda x,g: accr(x,g,calibrator=cal,lam=lam,p_flip=0.1,seed=0), dev)\n        if acc > best_acc:\n            best_acc, best_lam = acc, lam\n\n    for p in [0.0, 0.1, 0.2]:\n        acc_direct = eval_acc_strict(lambda x,g: direct(x), test)\n        acc_sr = eval_acc_strict(lambda x,g: self_refine(x,T=3), test)\n        acc_scg = eval_acc_strict(lambda x,g: scg_sr_proxy(x,g,lam=best_lam,p_flip=p,seed=0), test)\n        cal = ProxyCalibrator()\n        acc_accr = eval_acc_strict(lambda x,g: accr(x,g,calibrator=cal,lam=best_lam,p_flip=p,seed=0), test)\n        print({\"p_flip\": p, \"direct\": acc_direct, \"self_refine\": acc_sr,\n               \"scg_proxy\": acc_scg, \"accr\": acc_accr, \"lambda\": best_lam,\n               \"calib\": {\"a_pi\": cal.a_pi, \"b_pi\": cal.b_pi, \"a_nu\": cal.a_nu, \"b_nu\": cal.b_nu}})\n",
     "expected_result": "Because the proxy is *lenient* (any-number match) while the true metric is *strict* (first-number match), proxy-only selection is expected to systematically prefer verbose outputs that include the gold number somewhere but violate the strict format—classic reward hacking.\n\nPredicted strict accuracy (higher is better; illustrative numbers for flan-t5-small on this synthetic task):\n- p_flip=0.0:\n  - direct: 0.78–0.84\n  - SELF-REFINE: 0.75–0.82 (occasionally induces verbosity)\n  - SCG-SR(Proxy): 0.68–0.78 (over-optimizes lenient proxy)\n  - ACCR: 0.80–0.86 (recovers/improves by rejecting proxy-gamed candidates after a few audits)\n- p_flip=0.2:\n  - SCG-SR(Proxy) degrades further (e.g., 0.62–0.74)\n  - ACCR degrades more gracefully (e.g., 0.78–0.84), yielding +6 to +12 accuracy points over SCG-SR(Proxy).\n\nSecondary expectations:\n- Proxy score for SCG-SR(Proxy) will be high even when strict accuracy is low, demonstrating misalignment.\n- ACCR will use only ~T×(1–2) audit calls per instance (small overhead) but will reduce harmful drift and often stop earlier due to conservative acceptance.\n- Output length: SCG-SR(Proxy) tends to grow (proxy gaming); ACCR stays shorter due to both λ and audit-informed rejection.",
     "expected_conclusion": "ACCR upgrades confidence-gated self-refinement from robustness-to-noise to robustness-to-*misaligned* feedback, by adding an online audit-calibration layer that estimates and bounds proxy reliability at test time. Academically, it reframes automated prompt optimization as decision-making with a biased proxy and scarce high-fidelity labels, connecting self-refinement to selective auditing, calibration, and conservative (risk-limiting) sequential acceptance rules. Practically and socially, it mitigates reward hacking/specification gaming—one of the most consequential deployment failures—while requiring no training and only minimal expensive checks (e.g., occasional human review or full integration tests). This makes automated prompt optimization more dependable in real pipelines where cheap metrics are imperfect and safety hinges on not optimizing the wrong objective."
+  },
+  "experimental_design": {
+    "experiment_summary": "Task: For each math word problem, the system must output a final answer in a strict, machine-parseable format where the *first integer/number appearing in the model output* is the predicted answer. The experiment evaluates iterative test-time refinement controllers that generate candidate revisions, score them with a cheap but biased/noisy proxy verifier, and decide whether to accept a revision.\n\nPurpose: Demonstrate that the proposed Audit‑Calibrated Confidence Refinement (ACCR) controller is more robust than proxy-only self-refinement when the cheap feedback signal is systematically misaligned with the true deployment metric (reward hacking/spec gaming). ACCR couples (1) sequential proxy querying for candidate ranking with (2) online calibration from a small number of high-fidelity “audits” and (3) a conservative accept/stop rule based on credible bounds over true success.\n\nWorkflow (per instance):\n1) INITIAL: produce an initial answer.\n2) For up to T refinement rounds:\n   a) PROPOSE: generate a critique and B candidate refinements via stochastic decoding.\n   b) PROXY SELECTION: repeatedly query a *biased proxy* verifier on candidates under a proxy-call budget to estimate proxy success probabilities q(y) with uncertainty bounds.\n   c) AUDIT: spend a small audit budget to run the *true* evaluator on selected candidates; update global Beta posteriors for proxy precision π=P(True=1|Proxy=1) and true-negative rate ν=P(True=0|Proxy=0).\n   d) ACCEPT/STOP: compute conservative bounds on true utility using posterior quantiles of π and ν; accept a revision only if its lower bound exceeds the current solution’s upper bound by margin τ; otherwise stop early.\n\nProxy–true mismatch used to induce reward hacking: the true evaluator requires the *first extracted numeric token* to match gold, while the proxy evaluator returns success if *any numeric token anywhere* matches gold (plus optional stochastic label flips p_flip). This encourages verbose “show your work” outputs that include many numbers, which can score well on proxy while failing strict true scoring.\n\nScale to fit Runner (H200 140GB VRAM, 240GB RAM):\n- Use exactly two small/medium HF models (≤7B) and run inference-only (no fine-tuning).\n- Subsample evaluation to 500 problems per dataset (1,000 total) with fixed seeds.\n- Limit decoding to max_new_tokens=96, B=4 candidates/round, T=3 rounds.\n- Proxy calls capped at 12 per round; audits capped at 1 per round (≈3 audits/instance worst case).\n- Use bf16 + device_map=auto; generation batched where possible (num_return_sequences=B for proposals). This keeps runtime and VRAM well within a single H200.",
+    "runner_config": {
+      "runner_label": [
+        "self-hosted",
+        "gpu-runner"
+      ],
+      "description": "NVIDIA H200, VRAM: 140 GB, RAM: 240 GB"
+    },
+    "evaluation_metrics": [
+      {
+        "name": "accuracy",
+        "description": "Primary metric (strict exactness under the true evaluator).\n\nCorrectness criteria: For a model output string y and gold numeric answer g (normalized), extract the first numeric token from y using a regex that captures integers/decimals with optional sign (e.g., r\"[-+]?\\d+(?:\\.\\d+)?\"). The prediction is correct iff (i) at least one numeric token exists, and (ii) the first extracted token equals g after normalization. Normalization: strip spaces/commas, convert to Decimal; treat integers and decimals as exact string-equal after canonicalization (e.g., Decimal quantization). If the dataset provides integer answers (GSM8K/SVAMP mostly integers), this reduces to integer equality.\n\nCalculation method: accuracy = (1/N) * Σ_i 1[ true_correct(y_i, g_i) ].\n\nTask appropriateness: The hypothesis is about proxy-gaming causing failures on a strict deployment metric (a parser/validator). This metric directly represents that strict downstream requirement.\n\nRelevant visualizations: (1) Bar chart of accuracy by method and proxy-noise level p_flip. (2) Accuracy vs. audit budget (0,1,2) curve to show compute–risk trade-off. (3) Paired per-item win/loss heatmap between methods (ACCR vs SCG-SR) to show where ACCR avoids regressions."
+      },
+      {
+        "name": "proxy_success_rate",
+        "description": "Measures performance under the cheap, biased proxy verifier.\n\nCorrectness criteria: proxy(y,g)=1 iff *any* numeric token anywhere in y equals g after the same normalization as in accuracy; then optionally flip the binary label with probability p_flip to simulate flaky tests/reward-model noise.\n\nCalculation method: proxy_success_rate = (1/N) * Σ_i proxy(y_i, g_i).\n\nTask appropriateness: Needed to demonstrate proxy–true decoupling: proxy-only methods may increase proxy scores while decreasing true accuracy (reward hacking).\n\nRelevant visualizations: Scatter plot of (proxy_success_rate, accuracy) per method and p_flip; ideally ACCR lies closer to the diagonal while proxy-only refinement shifts right but down."
+      },
+      {
+        "name": "avg_output_length_tokens",
+        "description": "Average generated output length in model tokens (method-level).\n\nCorrectness criteria: Tokenize each final output y_i with the corresponding model tokenizer; length_i = number of tokens.\n\nCalculation method: avg_output_length_tokens = (1/N) * Σ_i length_i.\n\nTask appropriateness: Proxy is biased toward verbosity (including many numbers). Length quantifies verbosity hacking and allows assessing the effect of the length penalty λ and conservative acceptance.\n\nRelevant visualizations: Violin/box plots of output length by method; joint plot of length vs. proxy score to show proxy reward for verbosity."
+      },
+      {
+        "name": "avg_proxy_calls_per_instance",
+        "description": "Compute/cost metric: average number of proxy verifier queries used per instance.\n\nCorrectness criteria: Count every invocation of proxy_score_lenient for candidate evaluation and (if used) for re-evaluating the current solution.\n\nCalculation method: avg_proxy_calls_per_instance = (1/N) * Σ_i proxy_calls_i.\n\nTask appropriateness: Methods must be compared under similar compute budgets; this metric confirms budget adherence and shows ACCR’s overhead profile.\n\nRelevant visualizations: Stacked bar chart of proxy vs audit calls per instance by method."
+      },
+      {
+        "name": "avg_audit_calls_per_instance",
+        "description": "Compute/cost metric: average number of expensive high-fidelity audits used per instance.\n\nCorrectness criteria: Count every invocation of the strict true evaluator used *during refinement* for calibration/selection (exclude the final evaluation pass).\n\nCalculation method: avg_audit_calls_per_instance = (1/N) * Σ_i audit_calls_i.\n\nTask appropriateness: ACCR’s claim is improved robustness with a small audit budget; this metric quantifies that extra cost.\n\nRelevant visualizations: Accuracy vs avg_audit_calls Pareto frontier (trade-off curve) across audit budgets and methods."
+      },
+      {
+        "name": "avg_refinement_rounds",
+        "description": "Average number of refinement iterations executed before stopping.\n\nCorrectness criteria: rounds_i equals the number of completed refinement rounds for instance i (0..T).\n\nCalculation method: avg_refinement_rounds = (1/N) * Σ_i rounds_i.\n\nTask appropriateness: Conservative accept/stop rules should prevent harmful drift and stop earlier when improvements are not reliable.\n\nRelevant visualizations: Histogram of rounds-to-stop by method; survival curve (fraction not stopped vs round)."
+      },
+      {
+        "name": "reward_hacking_gap",
+        "description": "Measures the degree of proxy–true misalignment exploited by the method.\n\nCorrectness criteria: Compute per instance: gap_i = proxy(y_i,g_i) − true_correct(y_i,g_i) where both are in {0,1} (proxy includes p_flip).\n\nCalculation method: reward_hacking_gap = (1/N) * Σ_i gap_i.\n\nTask appropriateness: Directly quantifies cases where the model ‘passes the proxy but fails the true metric’—the failure mode ACCR aims to reduce.\n\nRelevant visualizations: Bar chart of gap by method and p_flip; confusion-style 2x2 table counts of (proxy pass/fail) vs (true pass/fail) for each method."
+      },
+      {
+        "name": "calibration_diagnostics_pi_nu",
+        "description": "Tracks ACCR’s online calibration estimates of proxy reliability.\n\nCorrectness criteria: ACCR maintains Beta posteriors for π=P(True=1|Proxy=1) and ν=P(True=0|Proxy=0) updated from audits. Report posterior mean and 95% credible interval (CI) at the end of evaluation, and optionally as a function of processed instances.\n\nCalculation method: For Beta(a,b): mean=a/(a+b); 95% CI via quantiles q=0.025,0.975 (e.g., torch.distributions.Beta.icdf).\n\nTask appropriateness: Validates that ACCR detects proxy misalignment and reflects uncertainty when audits are scarce.\n\nRelevant visualizations: Line plot of posterior mean with shaded CI for π and ν over evaluation steps; should stabilize as audits accumulate."
+      }
+    ],
+    "models_to_use": [
+      "google/flan-t5-small (~80M parameters)",
+      "mistralai/Mistral-7B-v0.3 (7.3B parameters)"
+    ],
+    "datasets_to_use": [
+      "openai/gsm8k (main)",
+      "MU-NLPC/Calc-svamp (SVAMP)"
+    ],
+    "proposed_method": {
+      "method_name": "Audit-Calibrated Confidence Refinement (ACCR)",
+      "description": "Inference-only refinement controller that is robust to *biased* and noisy proxy feedback. ACCR (i) proposes multiple candidate refinements, (ii) estimates proxy success probabilities with sequential sampling under a fixed proxy-call budget, (iii) spends a small number of high-fidelity audits to update online Beta posteriors over proxy precision π and true-negative rate ν, and (iv) applies a conservative accept/stop rule using posterior quantile bounds on the *true* success probability, regularized by a length penalty to reduce verbosity hacking.",
+      "optuna_config": {
+        "enabled": true,
+        "n_trials": 20,
+        "search_spaces": [
+          {
+            "param_name": "lam_length_penalty",
+            "distribution_type": "uniform",
+            "low": 0.0,
+            "high": 0.03
+          },
+          {
+            "param_name": "tau_accept_margin",
+            "distribution_type": "uniform",
+            "low": 0.0,
+            "high": 0.15
+          },
+          {
+            "param_name": "alpha_calibration",
+            "distribution_type": "categorical",
+            "choices": [
+              0.01,
+              0.05,
+              0.1
+            ]
+          },
+          {
+            "param_name": "per_round_audit_budget",
+            "distribution_type": "categorical",
+            "choices": [
+              0,
+              1,
+              2
+            ]
+          },
+          {
+            "param_name": "p_flip_dev",
+            "distribution_type": "categorical",
+            "choices": [
+              0.0,
+              0.1
+            ]
+          }
+        ]
+      }
+    },
+    "comparative_methods": [
+      {
+        "method_name": "SCG-SR(Proxy-only)",
+        "description": "Sequential confidence-gated self-refinement that uses only the cheap proxy verifier for candidate selection and acceptance (no audits, no proxy–true calibration). Uses Hoeffding-style bounds on proxy success rate to allocate proxy queries and to decide accept/stop, making it robust to stochastic proxy noise but vulnerable to systematic proxy bias/reward hacking.",
+        "optuna_config": {
+          "enabled": true,
+          "n_trials": 20,
+          "search_spaces": [
+            {
+              "param_name": "lam_length_penalty",
+              "distribution_type": "uniform",
+              "low": 0.0,
+              "high": 0.03
+            },
+            {
+              "param_name": "tau_accept_margin",
+              "distribution_type": "uniform",
+              "low": 0.0,
+              "high": 0.15
+            },
+            {
+              "param_name": "per_round_proxy_budget",
+              "distribution_type": "categorical",
+              "choices": [
+                8,
+                12,
+                16
+              ]
+            },
+            {
+              "param_name": "p_flip_dev",
+              "distribution_type": "categorical",
+              "choices": [
+                0.0,
+                0.1
+              ]
+            }
+          ]
+        }
+      }
+    ]
   }
 }
