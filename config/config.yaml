@@ -1,6 +1,8 @@
 defaults:
   - runs: proposed-flan-t5-small-calc-svamp
+  - _self_
 
+run: null
 mode: full
 results_dir: ./results
 seed: 0
