@@ -1,0 +1,42 @@
+run_id: proposed-mistral-7b-v0.3-calc-svamp
+method: Audit-Calibrated Confidence Refinement (ACCR)
+model:
+  name: mistralai/Mistral-7B-v0.3
+  dtype: bf16
+  device_map: auto
+dataset:
+  name: MU-NLPC/Calc-svamp
+  subset: SVAMP
+  split: test
+  max_length: 512
+  preprocessing:
+    normalize_numbers: true
+    extract_first_number: true
+training:
+  learning_rate: 0.0
+  batch_size: 1
+  epochs: 0
+  optimizer: adamw
+  warmup_steps: 0
+  gradient_accumulation_steps: 1
+  inference_only: true
+optuna:
+  n_trials: 20
+  search_spaces:
+    - param_name: lam_length_penalty
+      distribution_type: uniform
+      low: 0.0
+      high: 0.03
+    - param_name: tau_accept_margin
+      distribution_type: uniform
+      low: 0.0
+      high: 0.15
+    - param_name: alpha_calibration
+      distribution_type: categorical
+      choices: [0.01, 0.05, 0.1]
+    - param_name: per_round_audit_budget
+      distribution_type: categorical
+      choices: [0, 1, 2]
+    - param_name: p_flip_dev
+      distribution_type: categorical
+      choices: [0.0, 0.1]

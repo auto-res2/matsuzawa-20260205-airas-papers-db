@@ -1,1 +1,21 @@
-# Please list the required python packages.
+[project]
+name = "accr-experiments"
+version = "0.1.0"
+description = "ACCR proxy calibration experiments"
+requires-python = ">=3.10"
+
+[project.dependencies]
+torch = "*"
+transformers = "*"
+datasets = "*"
+hydra-core = "*"
+wandb = "*"
+optuna = "*"
+matplotlib = "*"
+seaborn = "*"
+pandas = "*"
+scipy = "*"
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
