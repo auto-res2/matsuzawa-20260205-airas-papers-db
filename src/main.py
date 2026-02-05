@@ -16,7 +16,7 @@ def main(cfg):
     elif cfg.mode == "full":
         cfg.wandb.mode = "online"
 
-    run_id = cfg.run.run_id
+    run_id = cfg.runs.run_id
     cmd = [
         sys.executable,
         "-u",

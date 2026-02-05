@@ -252,7 +252,7 @@ def main(cfg):
         wandb.init(
             entity=cfg.wandb.entity,
             project=cfg.wandb.project,
-            id=cfg.run.run_id,
+            id=cfg.runs.run_id,
             config=OmegaConf.to_container(cfg, resolve=True),
             resume="allow",
         )
@@ -277,7 +277,7 @@ def main(cfg):
 
     maybe_run_training(cfg, model_wrapper)
 
-    method_name = cfg.run.method
+    method_name = cfg.runs.method
     params = {
         "lam_length_penalty": cfg.method_cfg.lam_length_penalty,
         "tau_accept_margin": cfg.method_cfg.tau_accept_margin,

@@ -20,27 +20,27 @@ def beta_q(a, b, q):
 class GenModelWrapper:
     def __init__(self, cfg):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.tokenizer = AutoTokenizer.from_pretrained(cfg.run.model.name, cache_dir=".cache/")
+        self.tokenizer = AutoTokenizer.from_pretrained(cfg.runs.model.name, cache_dir=".cache/")
         if self.tokenizer.pad_token_id is None:
             if self.tokenizer.eos_token_id is not None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             else:
                 self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
-        dtype = torch.bfloat16 if cfg.run.model.dtype == "bf16" else torch.float32
-        if "t5" in cfg.run.model.name.lower():
+        dtype = torch.bfloat16 if cfg.runs.model.dtype == "bf16" else torch.float32
+        if "t5" in cfg.runs.model.name.lower():
             self.model = AutoModelForSeq2SeqLM.from_pretrained(
-                cfg.run.model.name,
+                cfg.runs.model.name,
                 cache_dir=".cache/",
                 torch_dtype=dtype,
-                device_map=cfg.run.model.device_map,
+                device_map=cfg.runs.model.device_map,
             )
         else:
             self.model = AutoModelForCausalLM.from_pretrained(
-                cfg.run.model.name,
+                cfg.runs.model.name,
                 cache_dir=".cache/",
                 torch_dtype=dtype,
-                device_map=cfg.run.model.device_map,
+                device_map=cfg.runs.model.device_map,
             )
         if len(self.tokenizer) != self.model.get_input_embeddings().num_embeddings:
             self.model.resize_token_embeddings(len(self.tokenizer))

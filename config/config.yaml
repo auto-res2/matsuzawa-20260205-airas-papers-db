@@ -1,5 +1,5 @@
 defaults:
-  - run: proposed-flan-t5-small-calc-svamp
+  - runs: proposed-flan-t5-small-calc-svamp
 
 mode: full
 results_dir: ./results
